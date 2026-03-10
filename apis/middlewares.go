@@ -290,6 +290,7 @@ func securityHeaders() *hook.Handler[*core.RequestEvent] {
 			e.Response.Header().Set("X-XSS-Protection", "1; mode=block")
 			e.Response.Header().Set("X-Content-Type-Options", "nosniff")
 			e.Response.Header().Set("X-Frame-Options", "SAMEORIGIN")
+			e.Response.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 
 			// @todo consider a default HSTS?
 			// (see also https://webkit.org/blog/8146/protecting-against-hsts-abuse/)

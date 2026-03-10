@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"regexp"
@@ -89,8 +91,87 @@ func NewFileFromMultipart(mh *multipart.FileHeader) (*File, error) {
 	return f, nil
 }
 
+// privateIPNets contains the IP networks considered private or otherwise
+// non-routable that should not be reachable via NewFileFromURL to prevent
+// Server-Side Request Forgery (SSRF) attacks.
+var privateIPNets []*net.IPNet
+
+func init() {
+	// loopback, link-local, private, and other special-use ranges
+	for _, cidr := range []string{
+		"127.0.0.0/8",    // IPv4 loopback
+		"10.0.0.0/8",     // RFC1918 private
+		"172.16.0.0/12",  // RFC1918 private
+		"192.168.0.0/16", // RFC1918 private
+		"169.254.0.0/16", // IPv4 link-local
+		"100.64.0.0/10",  // RFC6598 shared address space
+		"192.0.0.0/24",   // RFC6890 IETF protocol assignments
+		"198.18.0.0/15",  // RFC2544 benchmarking
+		"198.51.100.0/24", // RFC5737 documentation
+		"203.0.113.0/24", // RFC5737 documentation
+		"224.0.0.0/4",    // IPv4 multicast
+		"240.0.0.0/4",    // IPv4 reserved
+		"::1/128",        // IPv6 loopback
+		"fc00::/7",       // IPv6 unique local
+		"fe80::/10",      // IPv6 link-local
+		"ff00::/8",       // IPv6 multicast
+	} {
+		_, network, err := net.ParseCIDR(cidr)
+		if err == nil {
+			privateIPNets = append(privateIPNets, network)
+		}
+	}
+}
+
+// isPrivateIP reports whether ip is a private, loopback, or otherwise
+// non-routable IP address that must not be reached when fetching external URLs.
+func isPrivateIP(ip net.IP) bool {
+	for _, network := range privateIPNets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// safeURLHTTPClient is an HTTP client whose transport resolves each request
+// host to IP addresses and blocks any that fall within private/loopback ranges
+// to prevent SSRF attacks.
+var safeURLHTTPClient = &http.Client{
+	Transport: &ssrfSafeTransport{wrapped: http.DefaultTransport},
+}
+
+type ssrfSafeTransport struct {
+	wrapped http.RoundTripper
+}
+
+func (t *ssrfSafeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	host := req.URL.Hostname()
+
+	// Resolve the host to its IP addresses and reject private/loopback ones.
+	addrs, err := net.DefaultResolver.LookupHost(req.Context(), host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve host %q: %w", host, err)
+	}
+
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			continue
+		}
+		if isPrivateIP(ip) {
+			return nil, fmt.Errorf("requests to private/loopback addresses are not allowed (%s)", addr)
+		}
+	}
+
+	return t.wrapped.RoundTrip(req)
+}
+
 // NewFileFromURL creates a new File from the provided url by
 // downloading the resource and load it as BytesReader.
+//
+// Only http and https URL schemes are accepted. Requests to private,
+// loopback, or link-local addresses are rejected to prevent SSRF attacks.
 //
 // Example
 //
@@ -98,20 +179,31 @@ func NewFileFromMultipart(mh *multipart.FileHeader) (*File, error) {
 //	defer cancel()
 //
 //	file, err := filesystem.NewFileFromURL(ctx, "https://example.com/image.png")
-func NewFileFromURL(ctx context.Context, url string) (*File, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+func NewFileFromURL(ctx context.Context, rawURL string) (*File, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid url: %w", err)
+	}
+
+	// Allow only http and https to prevent accidental access to local
+	// resources via file://, gopher://, etc.
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, errors.New("only http and https url schemes are supported")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	res, err := http.DefaultClient.Do(req)
+	res, err := safeURLHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode < 200 || res.StatusCode > 399 {
-		return nil, fmt.Errorf("failed to download url %s (%d)", url, res.StatusCode)
+		return nil, fmt.Errorf("failed to download url %s (%d)", rawURL, res.StatusCode)
 	}
 
 	var buf bytes.Buffer
@@ -120,7 +212,7 @@ func NewFileFromURL(ctx context.Context, url string) (*File, error) {
 		return nil, err
 	}
 
-	return NewFileFromBytes(buf.Bytes(), path.Base(url))
+	return NewFileFromBytes(buf.Bytes(), path.Base(rawURL))
 }
 
 // -------------------------------------------------------------------

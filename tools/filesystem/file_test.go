@@ -149,6 +149,12 @@ func TestNewFileFromURLTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// The test server listens on 127.0.0.1 which is blocked by the SSRF protection
+	// built into NewFileFromURL.  Temporarily swap to an unrestricted client so we
+	// can test the download behaviour independently from the SSRF check.
+	restoreClient := filesystem.SetSafeHTTPClientForTest(http.DefaultClient)
+	defer restoreClient()
+
 	// cancelled context
 	{
 		ctx, cancel := context.WithCancel(context.Background())
@@ -199,6 +205,40 @@ func TestNewFileFromURLTimeout(t *testing.T) {
 		if _, ok := f.Reader.(*filesystem.BytesReader); !ok {
 			t.Fatalf("Expected Reader to be BytesReader, got %v", f.Reader)
 		}
+	}
+}
+
+func TestNewFileFromURLSSRF(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "secret")
+	}))
+	defer srv.Close()
+
+	// Unsupported URL schemes must be rejected before any network request.
+	schemeTests := []string{
+		"file:///etc/passwd",
+		"ftp://example.com/file.txt",
+		"gopher://example.com/",
+		"",
+	}
+	for _, rawURL := range schemeTests {
+		f, err := filesystem.NewFileFromURL(context.Background(), rawURL)
+		if err == nil {
+			t.Errorf("[scheme] Expected error for URL %q, got nil", rawURL)
+		}
+		if f != nil {
+			t.Errorf("[scheme] Expected nil file for URL %q, got %v", rawURL, f)
+		}
+	}
+
+	// Requests to private/loopback addresses must be blocked.
+	// The test server is on 127.0.0.1, so its URL is a perfect candidate.
+	f, err := filesystem.NewFileFromURL(context.Background(), srv.URL+"/private")
+	if err == nil {
+		t.Error("[loopback] Expected SSRF error for loopback address, got nil")
+	}
+	if f != nil {
+		t.Errorf("[loopback] Expected nil file for loopback address, got %v", f)
 	}
 }
 
