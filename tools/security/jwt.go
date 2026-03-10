@@ -44,13 +44,16 @@ func ParseJWT(token string, verificationKey string) (jwt.MapClaims, error) {
 
 // NewJWT generates and returns new HS256 signed JWT.
 func NewJWT(payload jwt.MapClaims, signingKey string, duration time.Duration) (string, error) {
-	claims := jwt.MapClaims{
-		"exp": time.Now().Add(duration).Unix(),
-	}
+	claims := jwt.MapClaims{}
 
 	for k, v := range payload {
 		claims[k] = v
 	}
+
+	// Always set exp after merging the payload so that duration is the
+	// authoritative source for the token's expiration and cannot be
+	// silently overridden by a caller-supplied "exp" value.
+	claims["exp"] = time.Now().Add(duration).Unix()
 
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(signingKey))
 }
