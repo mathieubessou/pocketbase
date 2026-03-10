@@ -144,10 +144,13 @@ func TestNewJWT(t *testing.T) {
 		{"empty, zero duration", jwt.MapClaims{}, "", 0, true},
 		{"empty, 10 seconds duration", jwt.MapClaims{}, "", 10 * time.Second, false},
 		{"non-empty, 10 seconds duration", jwt.MapClaims{"name": "test"}, "test", 10 * time.Second, false},
+		// A payload that contains "exp" must NOT override the duration-derived expiry.
+		{"payload exp must not override duration", jwt.MapClaims{"exp": float64(time.Now().Add(100 * 365 * 24 * time.Hour).Unix())}, "test", 10 * time.Second, false},
 	}
 
 	for _, s := range scenarios {
 		t.Run(s.name, func(t *testing.T) {
+			before := time.Now()
 			token, tokenErr := security.NewJWT(s.claims, s.key, s.duration)
 			if tokenErr != nil {
 				t.Fatalf("Expected NewJWT to succeed, got error %v", tokenErr)
@@ -164,20 +167,37 @@ func TestNewJWT(t *testing.T) {
 				return
 			}
 
-			if _, ok := claims["exp"]; !ok {
+			rawExp, ok := claims["exp"]
+			if !ok {
 				t.Fatalf("Missing required claim exp, got %v", claims)
+			}
+
+			// Verify that exp reflects the duration, not a caller-supplied value.
+			// Allow a 5-second window to account for test execution time.
+			expTime := time.Unix(int64(rawExp.(float64)), 0)
+			expectedMin := before.Add(s.duration - 5*time.Second)
+			expectedMax := before.Add(s.duration + 5*time.Second)
+			if expTime.Before(expectedMin) || expTime.After(expectedMax) {
+				t.Fatalf("exp %v is outside the expected window [%v, %v]; payload exp must not override duration", expTime, expectedMin, expectedMax)
 			}
 
 			// clear exp claim to match with the scenario ones
 			delete(claims, "exp")
 
-			if len(claims) != len(s.claims) {
-				t.Fatalf("Expected %v claims, got %v", s.claims, claims)
+			// also remove exp from the reference claims so the length check below works
+			refClaims := make(jwt.MapClaims, len(s.claims))
+			for k, v := range s.claims {
+				refClaims[k] = v
+			}
+			delete(refClaims, "exp")
+
+			if len(claims) != len(refClaims) {
+				t.Fatalf("Expected %v claims, got %v", refClaims, claims)
 			}
 
 			for k, v := range claims {
-				if v != s.claims[k] {
-					t.Fatalf("Expected %v for %q claim, got %v", s.claims[k], k, v)
+				if v != refClaims[k] {
+					t.Fatalf("Expected %v for %q claim, got %v", refClaims[k], k, v)
 				}
 			}
 		})
